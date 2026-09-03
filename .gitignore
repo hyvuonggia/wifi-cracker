@@ -1,0 +1,42 @@
+# --- temp / runtime artifacts (NEVER commit) ---
+/work/
+*.potfile
+*.log
+crack.log
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# --- compiled / caches ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# --- large wordlists fetched at runtime (not in repo) ---
+# rockyou.txt (134MB) exceeds GitHub's 100MB hard limit → crack_all.sh
+# downloads it on first run. Never commit it.
+wordlists/rockyou.txt
+wordlists/rockyou.txt.gz
+
+# --- raw capture data (large, curated separately) ---
+*.cap
+*.pcapng
+
+# --- handshake captures (actual wifi capture data — NOT part of the tool) ---
+# These are runtime inputs you drop into pending/ ; never commit real captures.
+# Use global patterns (no path prefix) so they match at any depth.
+*.pcap
+*.22000
+*.hc22000
+*.hccapx
+
+# --- git-lfs pointer for wordlist (not a usable wordlist) ---
+wordlists/vie_wpa2_pw/rockyou_wpa2.txt
+
+# Telegram bot token (local secret, never commit)
+.telegram_secret

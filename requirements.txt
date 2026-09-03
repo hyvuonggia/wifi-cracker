@@ -1,0 +1,2 @@
+hashcat==7.1.2
+hcxtools (optional, for hcxpcapngtool -> .22000)
