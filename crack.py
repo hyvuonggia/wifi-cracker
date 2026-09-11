@@ -468,12 +468,12 @@ def _tel(label):
 
 
 def run_dict(label, wordlist, hash_path, potfile, dry=False):
-    log = LOGDIR / f"{label}.log"
-    log.write_text("")
     OK(f"Step: {label}")
     if dry:
         print(f"  (dry) hashcat -a 0 {' '.join(HC_BASE)} --potfile-path {potfile} {hash_path} {wordlist}")
         return
+    log = LOGDIR / f"{label}.log"
+    log.write_text("")
     _tel(label)
     with log.open("a") as f:
         subprocess.run(
@@ -486,12 +486,12 @@ def run_dict_rule(label, wordlist, rule, hash_path, potfile, dry=False):
     if rule is None or not Path(rule).exists():
         WARN(f"SKIP {label}: rule file not found ({rule}) -- layer would be a no-op")
         return
-    log = LOGDIR / f"{label}.log"
-    log.write_text("")
     OK(f"Step: {label}   (wordlist + {Path(rule).name})")
     if dry:
         print(f"  (dry) hashcat -a 0 {' '.join(HC_BASE)} -r {rule} --potfile-path {potfile} {hash_path} {wordlist}")
         return
+    log = LOGDIR / f"{label}.log"
+    log.write_text("")
     _tel(label)
     with log.open("a") as f:
         subprocess.run(
@@ -511,6 +511,7 @@ def run_maskfile(label, maskfile, hash_path, potfile, dry=False):
         return False
     OK(f"Layer: {label} ({masks} masks, -a 3)")
     if not dry:
+        (LOGDIR / f"{label}.log").write_text("")   # fresh log for this layer
         _tel(label)
     for i, line in enumerate(maskfile.open(errors="replace"), 1):
         line = line.strip()
@@ -531,12 +532,12 @@ def run_maskfile(label, maskfile, hash_path, potfile, dry=False):
 
 
 def run_mask(label, mask_string, hash_path, potfile, dry=False):
-    log = LOGDIR / f"{label}.log"
-    log.write_text("")
     OK(f"Step: {label}  (mask {mask_string})")
     if dry:
         print(f"  (dry) hashcat -a 3 {' '.join(HC_BASE)} --potfile-path {potfile} {hash_path} {mask_string}")
         return
+    log = LOGDIR / f"{label}.log"
+    log.write_text("")
     _tel(label)
     with log.open("a") as f:
         subprocess.run(
@@ -623,8 +624,10 @@ def process_one(target: Path, opts) -> str:
         return "fail"
 
     potfile = POTFILES / f"{hash_path.stem}.potfile"
-    for d in (WORK, POTFILES, LOGDIR, ESSIDS):
-        d.mkdir(parents=True, exist_ok=True)
+    # Never create anything in --dry mode (that contract is what makes dry useful).
+    if not dry:
+        for d in (WORK, POTFILES, LOGDIR, ESSIDS):
+            d.mkdir(parents=True, exist_ok=True)
 
     OK("=" * 62)
     OK(f"Capture  : {pcap.name if pcap else '(none -- bare .22000)'}")
@@ -632,12 +635,9 @@ def process_one(target: Path, opts) -> str:
     OK(f"Potfile  : {potfile.name}")
     OK("=" * 62)
 
-    # --- already cracked in a previous run? ----------------------------
-    if is_cracked(hash_path, potfile):
-        WARN("Already cracked previously -- classifying as success without re-running.")
-        return _finish(hash_path, potfile, dry, t0)
-
-    # --- 1. CONVERT ----------------------------------------------------
+    # --- 1. CONVERT (always first: --convert-only must convert even when the
+    #        potfile already holds a password, and a re-dropped capture must get
+    #        its <base>_hs.22000 artifact back) ------------------------------
     essid_file = None
     if pcap is not None:
         INFO("Step: convert capture -> hashcat -m 22000")
@@ -646,12 +646,20 @@ def process_one(target: Path, opts) -> str:
             return "fail"
         if n_hashes == 0 and not dry:
             return _fail_no_handshake(pcap, hash_path, dry)
+        if dry and potfile.exists() and potfile.stat().st_size:
+            INFO(f"note: {potfile.name} already holds a password -- a live run would "
+                 "classify this capture as success without re-cracking")
     else:
         n_hashes = count_hashes(hash_path)
 
     if opts.convert_only:
         OK(f"--convert-only: {hash_path.name} ready, cracking skipped.")
         return "converted"
+
+    # --- already cracked in a previous run? ----------------------------
+    if is_cracked(hash_path, potfile):
+        WARN("Already cracked previously -- classifying as success without re-running.")
+        return _finish(hash_path, potfile, dry, t0)
 
     # --- 2. CRACK ------------------------------------------------------
     # Mask files come from the vie_wpa2_pw repo; normalise line endings (CRLF
@@ -716,6 +724,11 @@ def process_one(target: Path, opts) -> str:
                     return _finish(hash_path, potfile, dry, t0)
         elif dry and not ROCKYOU.exists():
             WARN(f"rockyou.txt missing ({ROCKYOU}) -- A1/A4/A5 would be skipped")
+        else:
+            # --full was asked for explicitly, so silence would look like success.
+            missing = [n for n, ok in ((f"rockyou.txt ({ROCKYOU})", ROCKYOU.exists()),
+                                       ("generic rule file", bool(GENERIC_RULE))) if not ok]
+            WARN(f"--full requested but missing: {', '.join(missing)} -- A1/A4/A5 cannot run")
 
     # ===== B: Vietnamese wordlists =====
     b_list = [

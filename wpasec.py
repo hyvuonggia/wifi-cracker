@@ -194,6 +194,9 @@ def push_path(target: Path) -> int:
             return 0
         files = [p]
     else:
+        if target.suffix.lower() not in CAPTURE_EXT:
+            print(f"  ! {target.name}: not a capture ({', '.join(CAPTURE_EXT)}) -- nothing to upload")
+            return 0
         files = [target]
 
     if not files:
