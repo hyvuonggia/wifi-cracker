@@ -76,6 +76,45 @@ python3 crack.py "file.22000" --dry    # liệt kê lệnh cho 1 file
 
 > Dry-run **không di chuyển file** — chỉ in ra file sẽ được xếp vào success/fail.
 
+### Chia việc với WPA-SEC (không làm trùng)
+
+`wpa-sec.stanev.org` đã có sẵn kho từ điển generic khổng lồ (hashes.org, OffSec 33M,
+InsidePro, Wikipedia ×5, OpenWall), **toàn bộ số 8 chữ số** (Num8) và khoá WPS mặc
+định. Chạy lại mấy thứ đó ở máy là làm trùng — dùng 2 cờ này để chia việc:
+
+```bash
+python3 crack.py --vn-only                          # CHỈ chạy phần wpa-sec KHÔNG có
+python3 crack.py --vn-only --wpasec                 # + tự đẩy .pcap lên wpa-sec khi fail
+python3 crack.py --background --vn-only --wpasec    # combo khuyến nghị
+```
+
+| Tầng | Ai làm | Lý do |
+|---|---|---|
+| `A1`/`A4`/`A5` (rockyou + rule) | **wpa-sec** | kho generic khổng lồ |
+| `C4`/`C5` (8 chữ số) | **wpa-sec** | Num8 = toàn bộ 10⁸ |
+| `A2`/`A3` (VN + rule VN) | máy bạn | wpa-sec không có rule tiếng Việt |
+| `B1`–`B7` (wordlist VN) | máy bạn | wpa-sec không có từ điển Việt |
+| `C1`–`C3` (mask ĐT VN) | máy bạn | ĐT VN là **10 số**, wpa-sec chỉ có 8 số |
+
+→ `--vn-only` tiết kiệm ~**7,4 giờ/hash** trên Quadro M2200, và **không cần tải
+`rockyou.txt`** (134MB) nữa.
+
+Thao tác tay với wpa-sec:
+
+```bash
+python3 wpasec.py status                  # kiểm tra key
+python3 wpasec.py push handshakes/fail/   # đẩy mọi .pcap chưa gửi
+python3 wpasec.py pull                    # tải mật khẩu wpa-sec đã tìm được
+```
+
+Key lấy ở https://wpa-sec.stanev.org/?get_key, lưu vào `~/wifi-cracker/.wpasec_key`
+(chmod 600, đã gitignore) hoặc biến môi trường `WPASEC_KEY`. **Không commit file
+key** — repo này là PUBLIC.
+
+⚠️ Server wpa-sec **CHỈ nhận `.pcap`/`.pcapng`, KHÔNG nhận `.22000`** (nó chạy
+`hcxpcapngtool`, tool này từ chối định dạng 22000). Phải giữ file `.pcap` gốc cạnh
+file `_hs.22000`, nếu không thì không đẩy lên được.
+
 ---
 
 ## Cách capture handshake (từ Cardputer/Porkchop)
@@ -86,28 +125,36 @@ python3 crack.py "file.22000" --dry    # liệt kê lệnh cho 1 file
 3. Chạy `python3 crack.py`.
 
 > Lưu ý: chỉ cần file `.22000` để crack; `.pcap` (bản gốc) được kéo theo để markup
-> SSID/BSSID dễ đọc, và để `hcxpcapngtool` xử lý lại nếu cần.
+> SSID/BSSID dễ đọc, và **bắt buộc giữ lại** nếu muốn đẩy lên wpa-sec (`--wpasec`
+> hoặc `wpasec.py push`) — server chỉ nhận pcap, không nhận `.22000`.
 
 ---
 
 ## Chi tiết pipeline (thứ tự tấn công)
 
-**Phase A — Rule/Dictionary** (rẻ, tỉ lệ trúng cao nhất — chạy trước)
-- `A1` rockyou + `best66.rule` (biến thể append số / đổi hoa thường)
-- `A2` VN leaked + `best66`
+**Phase A — Ưu tiên tiếng Việt** (rẻ, tỉ lệ trúng cao nhất — chạy trước)
+- `A2` VN leaked + `vn-heavy.rule` (446 rule: năm 1960–2029, đuôi số phổ biến,
+  `@`/`.`/`_`/`-`, leet)
 - `A3` VN leaked + `leetspeak.rule` (`trung@123` → `trung123`)
-- `A4` rockyou + `leetspeak`
-- `A5` rockyou + `combinator.rule` (`tên` + `năm`)
 
-**Phase B — Wordlist** (VN-specific)
+**Phase A′ — Generic** (wpa-sec ĐÃ CÓ → bỏ khi `--vn-only`)
+- `A1` rockyou + `best64.rule` · `A4` rockyou + `leetspeak` · `A5` rockyou + `combinator`
+
+**Phase B — Wordlist VN**
 - `B1` ngày tháng `vie-common_date` · `B2` vn1k · `B3` vn10k · `B4` vn1m ·
   `B5` vn-wifi
+- `B6` vn-wifi + `vn-lite.rule` · `B7` vn10k + `vn-heavy.rule`
 
 **Phase C — Mask** (brute theo pattern — sau cùng, trúng thấp)
 - `C1` phone VN main (28 prefix) · `C2` phone VN sub (13) · `C3` misc (hotline)
-- `C4` 8-số bất kỳ · `C5` 8-số bắt đầu bằng 0
+- `C4` 8-số bất kỳ · `C5` 8-số bắt đầu bằng 0 — *wpa-sec đã có (Num8) → bỏ khi `--vn-only`*
 
-Pipeline **dừng ngay khi crack được** (tiết kiệm thời gian trên máy quadrọ).
+Pipeline **dừng ngay khi crack được** (tiết kiệm thời gian trên máy Quadro).
+
+> `vn-heavy.rule` (446 rule) dùng cho wordlist **NHỎ**, `vn-lite.rule` (63 rule)
+> cho wordlist **LỚN** — nhiều rule × wordlist lớn = nổ không gian khoá. Cả 2 file
+> nằm trong `wordlists/`. Rule sinh từ **384.189 mật khẩu VN bị lộ**, đã tự kiểm
+> cú pháp bằng hashcat (0 lỗi).
 
 ---
 
@@ -119,6 +166,8 @@ Pipeline **dừng ngay khi crack được** (tiết kiệm thời gian trên má
 | Dry-run **vẫn move file** (move nhầm sang fail) | ⚠️ có | ✅ dry-run **chỉ in, không đụng filesystem** |
 | Chỉ crack 1 file (phải truyền) | ⚠️ có | ✅ **2 mode** (all-pending + 1 file) và phân loại tự động |
 | Phân loại thủ công | ⚠️ có | ✅ tự động success/fail/pending |
+| `RULE_DIR` trỏ `/usr/share/doc/hashcat/rules` (sai trên Debian/Arch) + rule `best66.rule` **không tồn tại** trong hashcat → **toàn bộ Phase A là code chết, chưa từng chạy** | ⚠️ có | ✅ tự dò đúng thư mục rules, dùng `best64.rule`, guard file thiếu (không crash) |
+| Chạy trùng keyspace với wpa-sec | ⚠️ có | ✅ `--vn-only` (bỏ tầng đã được cover) + `--wpasec` (đẩy phần còn lại) |
 
 ---
 
@@ -127,7 +176,9 @@ Pipeline **dừng ngay khi crack được** (tiết kiệm thời gian trên má
 - **hashcat 7.x** trên Arch: `sudo pacman -S hashcat`
 - GPU hoạt động qua **OpenCL**. Nếu bị cảnh báo "CUDA SDK not installed", thêm
   `--backend-ignore-cuda` (mặc định trong script) để sạch log.
-- `rockyou.txt` (134MB) KHÔNG commit (vượt giới hạn GitHub). `crack_all.sh` tự tải về khi thiếu 2014 từ seclists hệ thống hoặc mirror online.
+- `rockyou.txt` (134MB) KHÔNG commit (vượt giới hạn GitHub). `crack_all.sh` tự tải về
+  khi thiếu 2014 từ seclists hệ thống hoặc mirror online.
+  → **Chạy `--vn-only` thì KHÔNG cần `rockyou.txt`** (bỏ luôn tầng generic cho wpa-sec).
 ---
 
 ## Password đã crack nằm ở đâu?
@@ -138,3 +189,4 @@ Pipeline **dừng ngay khi crack được** (tiết kiệm thời gian trên má
   hashcat -m 22000 --potfile-path work/potfiles/<stem>.potfile --show <file.22000>
   ```
 - Hoặc đọc trực tiếp potfile (dòng `<hash>:<password>`).
+- Mật khẩu wpa-sec đã crack (sau `python3 wpasec.py pull`): `work/wpasec_results.txt`.

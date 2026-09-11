@@ -35,6 +35,21 @@ Usage
     ./crack.py "<hash.22000>"        # crack one file
     ./crack.py "<hash.22000>" --dry  # dry-run (print commands, don't crack)
     ./crack.py --background          # run all pending detached (nohup) -> log to work/crack.log
+
+CHIA VIỆC VỚI WPA-SEC (wpa-sec.stanev.org) — tránh làm trùng
+-----------------------------------------------------------
+    ./crack.py --vn-only                       # CHỈ chạy phần wpa-sec không có
+    ./crack.py --vn-only --wpasec              # + tự đẩy .pcap lên wpa-sec khi fail
+    ./crack.py --background --vn-only --wpasec # combo khuyến nghị
+
+  --vn-only : bỏ A1/A4/A5 (rockyou) và C4/C5 (8 chữ số) vì wpa-sec đã có
+              hashes.org/OffSec/InsidePro/Wikipedia/OpenWall + Num8 + WPSkey
+              + cracked.txt động. Tiết kiệm ~7,3 giờ mỗi hash trên Quadro M2200.
+              GIỮ LẠI: mọi thứ tiếng Việt (A2/A3/B1-B7) + mask ĐT VN 10 số (C1-C3)
+              vì wpa-sec không có gì cho tiếng Việt và chỉ có 8 chữ số.
+  --wpasec  : hash nào crack không được -> gửi .pcap đi kèm lên wpa-sec.
+              Key: env WPASEC_KEY hoặc ~/wifi-cracker/.wpasec_key (gitignore).
+              Thao tác tay: ./wpasec.py push | pull | status
 """
 
 from __future__ import annotations
@@ -64,10 +79,97 @@ VI_DIR     = WORDLISTS / "wordlists-vi"
 WORK       = BASE / "work"
 POTFILES   = WORK / "potfiles"
 LOGDIR     = WORK / "logs"
-RULE_DIR = Path(os.environ.get("HASHCAT_RULE_DIR", "/usr/share/doc/hashcat/rules"))
+def _find_rule_dir() -> Path:
+    """Tìm thư mục rules của hashcat.
+
+    BUG CŨ: cứng '/usr/share/doc/hashcat/rules' — Debian/Arch đặt ở
+    '/usr/share/hashcat/rules', nên MỌI tầng dùng rule chung (A1/A3/A4/A5) bị
+    bỏ qua âm thầm. Giờ dò lần lượt và chọn chỗ thật sự có best64.rule.
+    """
+    cands = []
+    env = os.environ.get("HASHCAT_RULE_DIR")
+    if env:
+        cands.append(Path(env))
+    cands += [
+        Path("/usr/share/hashcat/rules"),        # Debian, Arch, Fedora
+        Path("/usr/share/doc/hashcat/rules"),    # bản cũ trong repo
+        Path("/usr/local/share/hashcat/rules"),
+        Path("/opt/homebrew/share/hashcat/rules"),
+    ]
+    for c in cands:
+        if (c / "best64.rule").exists():
+            return c
+    print("  ! không tìm thấy thư mục rules của hashcat — tầng A1/A3/A4/A5 sẽ bị bỏ",
+          file=sys.stderr)
+    return cands[0]
+
+
+RULE_DIR = _find_rule_dir()
 
 ROCKYOU    = WORDLISTS / "rockyou.txt"          # full 14.3M line rockyou
 PERS       = DL_DIR / "vie-personal_dehashed_dict-18may2025.txt"
+
+# ---------------------------------------------------------------------------
+# Rule tiếng Việt (nằm TRONG repo -> không phụ thuộc hashcat rules dir)
+#   vn-heavy.rule : 446 rule, dùng cho wordlist NHỎ (PERS, vn1k, vn10k)
+#   vn-lite.rule  :  63 rule, dùng cho wordlist LỚN (vn1m, vn-combine, vn-wifi)
+# Sinh từ 384.189 mật khẩu VN bị lộ; tự kiểm cú pháp bằng hashcat --stdout.
+# LƯU Ý: best66.rule mà bản cũ trỏ tới KHÔNG tồn tại trong hashcat (cả upstream
+# lẫn gói Debian/Arch) -> tầng A1/A2 cũ bị bỏ qua âm thầm. Giờ dùng rule chuẩn
+# best64.rule làm phương án chung, và vn-*.rule cho phần Việt.
+# ---------------------------------------------------------------------------
+VN_HEAVY      = WORDLISTS / "vn-heavy.rule"
+VN_LITE       = WORDLISTS / "vn-lite.rule"
+BEST_RULE     = RULE_DIR / "best66.rule"     # không tồn tại ở hashcat chuẩn
+BEST_FALLBACK = RULE_DIR / "best64.rule"     # có sẵn mọi bản hashcat
+LEET_RULE     = RULE_DIR / "leetspeak.rule"
+COMB_RULE     = RULE_DIR / "combinator.rule"
+
+# ---------------------------------------------------------------------------
+# WPA-SEC (wpa-sec.stanev.org) — chia việc, tránh làm trùng
+#
+# wpa-sec ĐÃ CÓ (nên pipeline local BỎ QUA khi --vn-only):
+#   hashes.org 2015-2018, OffSec 33M, InsidePro, Wikipedia x5, OpenWall,
+#   Num8 (toàn bộ 8 chữ số), WPSkey 1-9, C-nets, Used, cracked.txt động, prdict
+# wpa-sec KHÔNG CÓ (pipeline local giữ lại):
+#   mọi thứ tiếng Việt + mask điện thoại VN 10 số (wpa-sec chỉ có 8 số)
+#
+# Key: env WPASEC_KEY hoặc file .wpasec_key (gitignore). KHÔNG hardcode vào repo.
+# ---------------------------------------------------------------------------
+WPASEC_KEY_FILE = BASE / ".wpasec_key"
+
+
+def wpasec_key():
+    """Key wpa-sec 32 hex. Env WPASEC_KEY > file .wpasec_key. None nếu chưa có."""
+    k = os.environ.get("WPASEC_KEY", "").strip()
+    if not k:
+        try:
+            k = WPASEC_KEY_FILE.read_text().strip()
+        except Exception:
+            return None
+    return k or None
+
+
+def wpasec_push(hash_path: Path) -> None:
+    """Gửi capture .pcap đi kèm lên wpa-sec (best-effort, không làm gãy pipeline)."""
+    if not wpasec_key():
+        WARN("bỏ qua wpa-sec: chưa có key (xem README — file .wpasec_key)")
+        return
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from wpasec import find_capture_for, push_file
+    except Exception as e:
+        WARN(f"bỏ qua wpa-sec: không import được wpasec.py ({e})")
+        return
+    pcap = find_capture_for(hash_path)
+    if not pcap:
+        WARN(f"bỏ qua wpa-sec: không thấy .pcap đi kèm {hash_path.name}")
+        return
+    OK(f"→ đẩy lên wpa-sec: {pcap.name}")
+    try:
+        push_file(pcap, wpasec_key())
+    except Exception as e:
+        WARN(f"wpa-sec lỗi (bỏ qua): {type(e).__name__}: {e}")
 
 HASHCAT    = "hashcat"
 # -m 22000: WPA/WPA2. -w 3: max workload. --backend-ignore-cuda: silence CUDA-RTC spinner.
@@ -311,9 +413,15 @@ def _finish(hash_path: Path, potfile: Path, dry: bool, _t0: float) -> str:
 
 # Main pipeline
 # ---------------------------------------------------------------------------
-def crack_one(hash_path: Path, dry: bool = False) -> str:
+def crack_one(hash_path: Path, dry: bool = False,
+              vn_only: bool = False, wpasec: bool = False) -> str:
     _t0 = time.time()
-    """Run the full layered attack on one .22000. Returns 'success' or 'fail'."""
+    """Run the full layered attack on one .22000. Returns 'success' or 'fail'.
+
+    vn_only=True -> chỉ chạy tầng wpa-sec KHÔNG có (tiếng Việt + mask ĐT VN 10 số),
+                    bỏ tầng trùng (rockyou/generic + 8 chữ số) để khỏi làm trùng.
+    wpasec=True  -> nếu crack không được, đẩy .pcap đi kèm lên wpa-sec.
+    """
     if not hash_path.exists():
         ERR(f"hashfile not found: {hash_path}")
         return "fail"
@@ -345,23 +453,39 @@ def crack_one(hash_path: Path, dry: bool = False) -> str:
                      (DL_DIR/"vie-miscnumber.rule",       M_MISC)]:
         if src.exists():
             n = normalize_crlf(src, dst)
-    OK(f"Mask files normalized: main={mask_count(M_MAIN)}, sub={mask_count(M_SUB)}, misc={mask_count(M_MISC)}")
+    def _mc(p: Path) -> int:
+        """mask_count() nhưng chịu được file thiếu (trước đây crash FileNotFoundError)."""
+        return mask_count(p) if p.exists() else 0
+    OK(f"Mask files normalized: main={_mc(M_MAIN)}, sub={_mc(M_SUB)}, misc={_mc(M_MISC)}")
     print()
 
-    # --- Phase A: rule/dict (cheap, high hit) ---
-    if ROCKYOU.exists():
-        run_dict_rule("A1_rockyou_best66", ROCKYOU, RULE_DIR/"best66.rule", hash_path, potfile, dry)
+    # --- Rule dùng được (best66.rule KHÔNG có trong hashcat -> fallback best64) ---
+    generic_rule = BEST_RULE if BEST_RULE.exists() else (
+        BEST_FALLBACK if BEST_FALLBACK.exists() else None)
+    heavy_rule = VN_HEAVY if VN_HEAVY.exists() else None
+    lite_rule  = VN_LITE  if VN_LITE.exists()  else None
+    if heavy_rule is None:
+        WARN(f"thiếu {VN_HEAVY.name} trong wordlists/ — tầng VN sẽ yếu (xem README)")
+
+    # ===== PHẦN VIỆT NAM — wpa-sec KHÔNG CÓ → LUÔN chạy =====
+    if PERS.exists() and heavy_rule:
+        run_dict_rule("A2_vn_heavy", PERS, heavy_rule, hash_path, potfile, dry)
         if is_cracked(hash_path, potfile): return _finish(hash_path, potfile, dry, _t0)
-    if PERS.exists():
-        run_dict_rule("A2_vn_best66", PERS, RULE_DIR/"best66.rule", hash_path, potfile, dry)
+    if PERS.exists() and LEET_RULE.exists():
+        run_dict_rule("A3_vn_leetspeak", PERS, LEET_RULE, hash_path, potfile, dry)
         if is_cracked(hash_path, potfile): return _finish(hash_path, potfile, dry, _t0)
-        run_dict_rule("A3_vn_leetspeak", PERS, RULE_DIR/"leetspeak.rule", hash_path, potfile, dry)
+
+    # ===== PHẦN GENERIC — wpa-sec ĐÃ CÓ (hashes.org/OffSec/InsidePro/Wikipedia/
+    #       OpenWall + cracked.txt động) → BỎ khi --vn-only, để wpa-sec làm =====
+    if not vn_only and ROCKYOU.exists() and generic_rule:
+        run_dict_rule("A1_rockyou_generic", ROCKYOU, generic_rule, hash_path, potfile, dry)
         if is_cracked(hash_path, potfile): return _finish(hash_path, potfile, dry, _t0)
-    if ROCKYOU.exists():
-        run_dict_rule("A4_rockyou_leetspeak", ROCKYOU, RULE_DIR/"leetspeak.rule", hash_path, potfile, dry)
-        if is_cracked(hash_path, potfile): return _finish(hash_path, potfile, dry, _t0)
-        run_dict_rule("A5_rockyou_combinator", ROCKYOU, RULE_DIR/"combinator.rule", hash_path, potfile, dry)
-        if is_cracked(hash_path, potfile): return _finish(hash_path, potfile, dry, _t0)
+        if LEET_RULE.exists():
+            run_dict_rule("A4_rockyou_leetspeak", ROCKYOU, LEET_RULE, hash_path, potfile, dry)
+            if is_cracked(hash_path, potfile): return _finish(hash_path, potfile, dry, _t0)
+        if COMB_RULE.exists():
+            run_dict_rule("A5_rockyou_combinator", ROCKYOU, COMB_RULE, hash_path, potfile, dry)
+            if is_cracked(hash_path, potfile): return _finish(hash_path, potfile, dry, _t0)
 
     # --- Phase B: wordlists ---
     b_list = [
@@ -376,26 +500,48 @@ def crack_one(hash_path: Path, dry: bool = False) -> str:
             run_dict(label, wl, hash_path, potfile, dry)
             if is_cracked(hash_path, potfile): return _finish(hash_path, potfile, dry, _t0)
 
+    # --- Phase B2: wordlist VN + RULE VN (wpa-sec không có rule tiếng Việt) ---
+    b_rule_list = []
+    if lite_rule and (VI_DIR/"wordlists-vn-wifi.txt.txt").exists():
+        b_rule_list.append(("B6_vn_wifi_lite", VI_DIR/"wordlists-vn-wifi.txt.txt", lite_rule))
+    if heavy_rule and (VI_DIR/"wordlists-vn10k.txt").exists():
+        b_rule_list.append(("B7_vn10k_heavy", VI_DIR/"wordlists-vn10k.txt", heavy_rule))
+    for label, wl, rule in b_rule_list:
+        run_dict_rule(label, wl, rule, hash_path, potfile, dry)
+        if is_cracked(hash_path, potfile): return _finish(hash_path, potfile, dry, _t0)
+
     # --- Phase C: masks ---
+    #   C1-C3 = mask điện thoại / số VN 10 chữ số  -> wpa-sec CHỈ có 8 số, nên GIỮ
     for label, mf in [("C1_phone_main", M_MAIN), ("C2_phone_sub", M_SUB), ("C3_misc", M_MISC)]:
         if mf.exists() and run_maskfile(label, mf, hash_path, potfile, dry):
             return _finish(hash_path, potfile, dry, _t0)
-    for label, mask in [("C4_8digit", "?d?d?d?d?d?d?d?d"), ("C5_leading0", "0?d?d?d?d?d?d?d")]:
-        run_mask(label, mask, hash_path, potfile, dry)
-        if is_cracked(hash_path, potfile): return _finish(hash_path, potfile, dry, _t0)
+    #   C4-C5 = 8 chữ số bất kỳ / 8 số đầu 0 -> wpa-sec đã có Num8 (toàn bộ 8 số)
+    if not vn_only:
+        for label, mask in [("C4_8digit", "?d?d?d?d?d?d?d?d"), ("C5_leading0", "0?d?d?d?d?d?d?d")]:
+            run_mask(label, mask, hash_path, potfile, dry)
+            if is_cracked(hash_path, potfile): return _finish(hash_path, potfile, dry, _t0)
 
     WARN(f"No password recovered for {hash_path.name}.")
     WARN(f"Review logs: {LOGDIR}")
+    # Không crack được -> đẩy phần còn lại lên wpa-sec (làm TRƯỚC _finish vì
+    # classify() sẽ chuyển cả .pcap sang fail/)
+    if wpasec and not dry:
+        wpasec_push(hash_path)
     return _finish(hash_path, potfile, dry, _t0)
 
 
 def main(argv):
     dry = False
     bg  = False
+    vn_only = False
+    wpasec  = False
     hash_file = None
-    args = [a for a in argv[1:] if a not in ("--dry", "--background")]
+    FLAGS = ("--dry", "--background", "--vn-only", "--wpasec")
+    args = [a for a in argv[1:] if a not in FLAGS]
     if "--dry" in argv: dry = True
     if "--background" in argv: bg = True
+    if "--vn-only" in argv: vn_only = True
+    if "--wpasec" in argv: wpasec = True
     if args:
         hash_file = Path(args[0]).expanduser()
 
@@ -404,17 +550,22 @@ def main(argv):
         logf = WORK / "crack.log"
         logf.parent.mkdir(parents=True, exist_ok=True)
         print(f"Starting background run → logging to {logf}")
+        child_args = [a for a in argv[1:] if a != "--background"]
         with logf.open("a") as f:
-            n = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), *args],
+            n = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), *child_args],
                                  stdout=f, stderr=subprocess.STDOUT,
                                  stdin=subprocess.DEVNULL, start_new_session=True)
         print(f"PID {n.pid}")
         return 0
 
     OK("=== WPA2 crack pipeline (rule-based + masks) ===")
+    if vn_only:
+        OK("Chế độ VN-ONLY: bỏ tầng wpa-sec đã có (rockyou/generic + 8 chữ số)")
+    if wpasec:
+        OK("Chế độ WPASEC: hash nào không crack được sẽ đẩy .pcap lên wpa-sec")
     if hash_file:
         OK(f"Mode: SINGLE → {hash_file}")
-        crack_one(hash_file, dry)
+        crack_one(hash_file, dry, vn_only=vn_only, wpasec=wpasec)
         return 0
 
     OK("Mode: ALL → cracking every pending hash sequentially")
@@ -429,7 +580,7 @@ def main(argv):
 
     summary = {"success": 0, "fail": 0}
     for h in pending:
-        result = crack_one(h, dry)
+        result = crack_one(h, dry, vn_only=vn_only, wpasec=wpasec)
         summary[result] += 1
         print()
 

@@ -40,3 +40,15 @@ wordlists/vie_wpa2_pw/rockyou_wpa2.txt
 
 # Telegram bot token (local secret, never commit)
 .telegram_secret
+
+# wpa-sec API key (local secret, never commit — this repo is PUBLIC)
+.wpasec_key
+work/wpasec_uploaded.txt
+work/wpasec_results.txt
+
+# --- generated VN wordlists (derived artifacts, too large to commit) ---
+# vn-heavy.rule / vn-lite.rule ARE committed (small, needed by crack.py).
+# The expanded dicts are rebuilt on demand; never commit them.
+wordlists/vn-base.txt
+wordlists/vn-variants.txt
+wordlists/vn-*.gz
