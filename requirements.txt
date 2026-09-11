@@ -1,2 +1,17 @@
-hashcat==7.1.2
-hcxtools (optional, for hcxpcapngtool -> .22000)
+# Runtime requirements for the wifi-cracker pipeline.
+#
+# hashcat    : the cracking engine (6.x or 7.x both work)
+#              Arch/CachyOS : sudo pacman -S hashcat
+#              Debian/Ubuntu: sudo apt install hashcat
+# hcxtools   : provides hcxpcapngtool, which converts .pcap/.pcapng/.cap
+#              captures into the hashcat -m 22000 hash file. REQUIRED for the
+#              pcap-first pipeline (crack.py refuses to crack a capture without it).
+#              Arch/CachyOS : sudo pacman -S hcxtools
+#              Debian/Ubuntu: sudo apt install hcxtools
+# python3    : 3.10+ (stdlib only, no pip packages are used)
+#
+# An OpenCL-capable GPU is what makes this fast (Quadro M2200: ~94k H/s at -m 22000).
+
+hashcat
+hcxtools
+python3>=3.10

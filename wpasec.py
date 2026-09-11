@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-wpasec.py — đẩy / kéo wpa-sec (wpa-sec.stanev.org)
+wpasec.py -- push / pull client for wpa-sec (wpa-sec.stanev.org).
 
-Chia việc với pipeline local: cái gì pipeline local KHÔNG làm được (từ điển
-generic khổng lồ + toàn bộ 8 số + WPSkey + cracked.txt động) thì để wpa-sec gặm.
+Splitting the work with the local pipeline: whatever the local box CANNOT do
+(the huge generic dictionaries, the complete 8-digit space, WPSkey, the dynamic
+cracked.txt) is handed to wpa-sec's volunteer GPUs. The local box keeps the
+Vietnamese layers, which the server has nothing for.
 
-KEY: đọc từ env WPASEC_KEY, hoặc file ~/wifi-cracker/.wpasec_key (gitignore, chmod 600).
-KHÔNG hardcode key vào file này — repo WiFi-cracker là PUBLIC.
+KEY: read from the WPASEC_KEY environment variable, or from
+     ~/wifi-cracker/.wpasec_key  (gitignored, chmod 600).
+     NEVER hardcode a key in this file -- this repository is PUBLIC.
+     Get a key at https://wpa-sec.stanev.org/?get_key
 
-API (đã đối chiếu source server dwpa/web/content/submit.php + common.php):
+API (verified against the server source, dwpa/web/content/submit.php + common.php):
   - upload : POST https://wpa-sec.stanev.org/?submit
-             multipart/form-data, field name = "webfile"
+             multipart/form-data, field name "webfile"
              Cookie: key=<32 hex>   (common.php: $userkey = $_COOKIE['key'])
-             server CHỈ nhận pcap native / pcapng  -> KHÔNG gửi .22000
-  - kết quả: GET  https://wpa-sec.stanev.org/?api&dl=1  + Cookie key=<hex>
+             the server accepts native pcap / pcapng ONLY -> never send .22000
+  - results: GET  https://wpa-sec.stanev.org/?api&dl=1  + Cookie key=<hex>
 
-Dùng:
-    ./wpasec.py pull                      # tải mật khẩu đã crack về
-    ./wpasec.py push capture.pcap         # gửi 1 pcap
-    ./wpasec.py push handshakes/fail/     # gửi mọi .pcap trong thư mục (đệ quy)
-    ./wpasec.py status                    # kiểm tra key + thống kê
+Usage:
+    ./wpasec.py pull                       # download passwords already cracked
+    ./wpasec.py push capture.pcap          # upload one capture
+    ./wpasec.py push handshakes/fail/      # upload every .pcap in a folder (recursive)
+    ./wpasec.py status                     # check the key + counters
+
+NOTE: wpa-sec results are public and searchable by BSSID+SSID. Never upload your
+own home network -- lab captures only.
 """
 from __future__ import annotations
 
@@ -34,7 +41,7 @@ import urllib.request
 from pathlib import Path
 from uuid import uuid4
 
-BASE = Path.home() / "wifi-cracker"
+BASE = Path(os.environ.get("WIFI_CRACKER_DIR", "") or (Path.home() / "wifi-cracker"))
 WPASEC_KEY_FILE = BASE / ".wpasec_key"
 UPLOADED_LOG = BASE / "work" / "wpasec_uploaded.txt"
 RESULTS_FILE = BASE / "work" / "wpasec_results.txt"
@@ -44,12 +51,12 @@ SUBMIT_URL = f"https://{HOST}/?submit"
 POTFILE_URL = f"https://{HOST}/?api&dl=1"
 TIMEOUT = 180
 
-# pcap native / pcapng — thứ server thực sự nhận
+# native pcap / pcapng -- what the server actually accepts
 CAPTURE_EXT = (".pcap", ".pcapng", ".cap")
 
 
 def key() -> str | None:
-    """Key 32 hex. env WPASEC_KEY > ~/wifi-cracker/.wpasec_key. None nếu chưa có."""
+    """32 hex characters. env WPASEC_KEY > ~/wifi-cracker/.wpasec_key. None if unset."""
     k = os.environ.get("WPASEC_KEY", "").strip()
     if not k:
         try:
@@ -59,7 +66,7 @@ def key() -> str | None:
     if not k:
         return None
     if not re.fullmatch(r"[0-9a-fA-F]{32}", k):
-        print(f"  ! key sai định dạng (cần 32 ký tự hex, đang có {len(k)})", file=sys.stderr)
+        print(f"  ! malformed key (need 32 hex characters, got {len(k)})", file=sys.stderr)
         return None
     return k
 
@@ -68,16 +75,16 @@ def _require_key() -> str:
     k = key()
     if not k:
         sys.exit(
-            "Chưa có key wpa-sec.\n"
-            f"  Lấy key: https://wpa-sec.stanev.org/?get_key\n"
-            f"  Rồi:    printf '%s' '<key-32-hex>' > {WPASEC_KEY_FILE} && chmod 600 {WPASEC_KEY_FILE}\n"
-            "  (hoặc: export WPASEC_KEY=<key>)"
+            "No wpa-sec key configured.\n"
+            f"  Get one: https://wpa-sec.stanev.org/?get_key\n"
+            f"  Then:    printf '%s' '<32-hex-key>' > {WPASEC_KEY_FILE} && chmod 600 {WPASEC_KEY_FILE}\n"
+            "  (or: export WPASEC_KEY=<key>)"
         )
     return k
 
 
 # ---------------------------------------------------------------------------
-# Upload tracking — tránh gửi trùng (server cũng dedup theo hash, nhưng đỡ tốn)
+# Upload tracking -- avoids re-sending (the server also dedupes by hash)
 # ---------------------------------------------------------------------------
 def _load_uploaded() -> set[str]:
     try:
@@ -96,7 +103,7 @@ def _mark_uploaded(name: str) -> None:
 # Upload
 # ---------------------------------------------------------------------------
 def _multipart(field: str, filepath: Path):
-    """Dựng body multipart/form-data + boundary (thuần stdlib)."""
+    """Build a multipart/form-data body + boundary (pure stdlib)."""
     boundary = "----WiFiCracker" + uuid4().hex
     ctype = mimetypes.guess_type(filepath.name)[0] or "application/octet-stream"
     head = (
@@ -109,13 +116,13 @@ def _multipart(field: str, filepath: Path):
 
 
 def push_file(pcap: Path, k: str | None = None, quiet: bool = False) -> bool:
-    """Gửi 1 file capture lên wpa-sec. True nếu server nhận."""
+    """Upload one capture to wpa-sec. True when the server accepted it."""
     k = k or _require_key()
     if not pcap.exists():
-        print(f"  ! không có file: {pcap}")
+        print(f"  ! no such file: {pcap}")
         return False
     if pcap.suffix.lower() not in CAPTURE_EXT:
-        print(f"  ! {pcap.name}: server chỉ nhận {', '.join(CAPTURE_EXT)} — bỏ qua")
+        print(f"  ! {pcap.name}: the server only accepts {', '.join(CAPTURE_EXT)} -- skipped")
         return False
 
     boundary, body = _multipart("webfile", pcap)
@@ -134,10 +141,10 @@ def push_file(pcap: Path, k: str | None = None, quiet: bool = False) -> bool:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
             code, text = r.status, r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
-        if e.code == 409:                      # đã gửi trước đó
+        if e.code == 409:                      # already submitted before
             _mark_uploaded(pcap.name)
             if not quiet:
-                print(f"  = {pcap.name}: đã có trên server (409)")
+                print(f"  = {pcap.name}: already on the server (409)")
             return True
         print(f"  ! {pcap.name}: HTTP {e.code} {e.reason}")
         return False
@@ -145,28 +152,29 @@ def push_file(pcap: Path, k: str | None = None, quiet: bool = False) -> bool:
         print(f"  ! {pcap.name}: {type(e).__name__}: {e}")
         return False
 
-    # Server in kết quả trong <pre>
+    # The server prints its verdict inside <pre>
     m = re.search(r"<pre>(.*?)</pre>", text, re.S)
     summary = (m.group(1).strip() if m else text.strip())[:400]
     bad = "not a valid capture" in summary.lower()
     if bad:
-        print(f"  ! {pcap.name}: server từ chối — {summary}")
+        print(f"  ! {pcap.name}: server rejected it -- {summary}")
         return False
     _mark_uploaded(pcap.name)
     if not quiet:
-        print(f"  + {pcap.name}: OK — {summary or 'đã nhận'}")
+        print(f"  + {pcap.name}: OK -- {summary or 'accepted'}")
     return True
 
 
 def find_capture_for(hash_path: Path) -> Path | None:
-    """Với 1 file _hs.22000, tìm .pcap đi kèm (server cần pcap, không nhận 22000)."""
+    """The capture belonging to a <base>_hs.22000 file (the server needs pcap, not 22000)."""
     stem = hash_path.name
-    for suf in ("_hs.22000", ".22000", ".hccapx"):
+    for suf in ("_hs.22000", ".22000", ".hc22000", ".hccapx"):
         if stem.endswith(suf):
             stem = stem[: -len(suf)]
             break
     for cand in (hash_path.with_name(stem + ".pcap"),
                  hash_path.with_name(stem + ".pcapng"),
+                 hash_path.with_name(stem + ".cap"),
                  hash_path.with_suffix(".pcap")):
         if cand.exists():
             return cand
@@ -174,39 +182,39 @@ def find_capture_for(hash_path: Path) -> Path | None:
 
 
 def push_path(target: Path) -> int:
-    """Gửi 1 file hoặc cả thư mục. Trả về số file gửi thành công."""
+    """Upload one file or a whole folder. Returns the number of new uploads."""
     k = _require_key()
     if target.is_dir():
         files = sorted(p for p in target.rglob("*") if p.suffix.lower() in CAPTURE_EXT)
-    elif target.suffix.lower() == ".22000":
+    elif target.suffix.lower() in (".22000", ".hc22000"):
         p = find_capture_for(target)
         if not p:
-            print(f"  ! {target.name}: không thấy .pcap đi kèm.")
-            print("    Server wpa-sec KHÔNG nhận .22000 — cần giữ file .pcap gốc từ PorkChop.")
+            print(f"  ! {target.name}: no .pcap next to it.")
+            print("    wpa-sec does NOT accept .22000 -- keep the original .pcap from Porkchop.")
             return 0
         files = [p]
     else:
         files = [target]
 
     if not files:
-        print(f"  (không có file capture nào trong {target})")
+        print(f"  (no capture files in {target})")
         return 0
 
     done = _load_uploaded()
     ok = 0
-    print(f"Gửi {len(files)} file lên {HOST} ...")
+    print(f"Uploading {len(files)} file(s) to {HOST} ...")
     for f in files:
         if f.name in done:
-            print(f"  = {f.name}: đã gửi trước đó, bỏ qua")
+            print(f"  = {f.name}: already uploaded, skipped")
             continue
         if push_file(f, k):
             ok += 1
-    print(f"→ xong: {ok}/{len(files)} gửi mới")
+    print(f"-> done: {ok}/{len(files)} new upload(s)")
     return ok
 
 
 # ---------------------------------------------------------------------------
-# Pull kết quả đã crack
+# Pull cracked results
 # ---------------------------------------------------------------------------
 def pull() -> int:
     k = _require_key()
@@ -216,47 +224,47 @@ def pull() -> int:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
             data = r.read().decode("utf-8", "replace")
     except Exception as e:
-        print(f"  ! không tải được kết quả: {type(e).__name__}: {e}")
+        print(f"  ! could not download results: {type(e).__name__}: {e}")
         return 0
     RESULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     RESULTS_FILE.write_text(data)
     lines = [ln for ln in data.splitlines() if ln.strip()]
-    print(f"Đã lưu {len(lines)} dòng vào {RESULTS_FILE}")
+    print(f"Saved {len(lines)} line(s) to {RESULTS_FILE}")
     if lines:
-        print("Mật khẩu wpa-sec đã tìm được cho bạn:")
+        print("Passwords wpa-sec found for your uploads:")
         for ln in lines[:40]:
-            # định dạng potfile: <hash>*<essid>:<pass>
+            # potfile format: <hash>*<essid>:<pass>
             print("   " + ln)
         if len(lines) > 40:
-            print(f"   ... và {len(lines)-40} dòng nữa")
+            print(f"   ... and {len(lines)-40} more")
     else:
-        print("(chưa có kết quả nào — key mới hoặc các mạng chưa crack xong)")
+        print("(no results yet -- new key, or your captures have not been reached in the queue)")
     return len(lines)
 
 
 def status() -> int:
     k = key()
     if not k:
-        print("Trạng thái: CHƯA cấu hình key")
-        print(f"  → printf '%s' '<key>' > {WPASEC_KEY_FILE} && chmod 600 {WPASEC_KEY_FILE}")
+        print("Status: NO key configured")
+        print(f"  -> printf '%s' '<key>' > {WPASEC_KEY_FILE} && chmod 600 {WPASEC_KEY_FILE}")
         return 1
-    print(f"Trạng thái: key OK ({k[:8]}…{k[-4:]})")
-    print(f"  file key : {WPASEC_KEY_FILE}")
-    print(f"  đã gửi   : {len(_load_uploaded())} file (log: {UPLOADED_LOG})")
+    print(f"Status: key OK ({k[:8]}...{k[-4:]})")
+    print(f"  key file  : {WPASEC_KEY_FILE}")
+    print(f"  uploaded  : {len(_load_uploaded())} file(s) (log: {UPLOADED_LOG})")
     if RESULTS_FILE.exists():
         n = len([l for l in RESULTS_FILE.read_text().splitlines() if l.strip()])
-        print(f"  kết quả  : {n} dòng trong {RESULTS_FILE}")
-    print(f"  tải kết quả: {POTFILE_URL}")
+        print(f"  results   : {n} line(s) in {RESULTS_FILE}")
+    print(f"  results URL: {POTFILE_URL}")
     return 0
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="wpa-sec push/pull (wpa-sec.stanev.org)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("push", help="gửi capture .pcap lên wpa-sec")
-    p.add_argument("target", type=Path, help="file .pcap hoặc thư mục")
-    sub.add_parser("pull", help="tải mật khẩu wpa-sec đã crack về")
-    sub.add_parser("status", help="kiểm tra key + thống kê")
+    p = sub.add_parser("push", help="upload a .pcap capture to wpa-sec")
+    p.add_argument("target", type=Path, help=".pcap file or a folder")
+    sub.add_parser("pull", help="download passwords wpa-sec already cracked")
+    sub.add_parser("status", help="check the key + counters")
     a = ap.parse_args(argv)
 
     if a.cmd == "push":

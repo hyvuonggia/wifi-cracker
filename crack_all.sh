@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 # =============================================================================
-# crack_all.sh — ENTRY POINT for the WPA2 crack pipeline.
+# crack_all.sh — ENTRY POINT for the WPA/WPA2 crack pipeline.
 #
 # THIS IS THE SHELL WRAPPER. It:
-#   1. Checks the environment (python3, hashcat, OpenCL/GPU, wordlists).
-#   2. Installs anything missing (pacman for hashcat; clone for wordlists).
+#   1. Checks the environment (python3, hashcat, hcxpcapngtool, OpenCL/GPU, wordlists).
+#   2. Installs anything missing (pacman/apt/dnf/... for hashcat + hcxtools).
 #   3. Delegates ALL cracking logic to crack.py, passing through every argument.
 #
 # So the entry point is ALWAYS this .sh file, never crack.py directly.
 # (Unless you pass --python to run crack.py straight, for debugging.)
 #
+# The pipeline is pcap-first: drop a .pcap/.pcapng/.cap into handshakes/pending/
+# and crack.py converts it with hcxpcapngtool before it touches hashcat.
+#
 # USAGE (same semantics as crack.py):
-#   ./crack_all.sh                     # crack all pending
-#   ./crack_all.sh "<hash file .22000>" # crack a single file
-#   ./crack_all.sh --dry               # dry run (no crack, no file move)
-#   ./crack_all.sh --background        # run all pending detached
+#   ./crack_all.sh                      # convert + crack all pending captures
+#   ./crack_all.sh "<capture.pcap>"     # one capture (a bare .22000 works too)
+#   ./crack_all.sh --dry                # dry run (no crack, no file move)
+#   ./crack_all.sh --convert-only       # only pcap -> _hs.22000
+#   ./crack_all.sh --background         # run all pending detached
+#   ./crack_all.sh --full               # also run the layers wpa-sec already covers
+#   ./crack_all.sh --no-wpasec          # never upload to wpa-sec
 #
 # =============================================================================
 
@@ -81,7 +87,7 @@ PYVER=$(python3 -V 2>&1 | awk '{print $2}')
 OK "python3 ${PYVER}"
 
 # ---------------------------------------------------------------------------
-# 2. hashcat + rules
+# 2a. hashcat + rules
 # ---------------------------------------------------------------------------
 HASHCAT_BIN=$(command -v hashcat || true)
 if [ -z "$HASHCAT_BIN" ]; then
@@ -91,25 +97,41 @@ if [ -z "$HASHCAT_BIN" ]; then
 fi
 OK "hashcat: $($HASHCAT_BIN --version 2>/dev/null | head -1)"
 
-# hashcat rules live in different places on different distros.
-# Try the common candidates in order.
+# hashcat rules live in different places on different distros, and the file names
+# changed in 7.x (best66.rule replaced best64.rule). A missing rule file is not
+# an error to hashcat — the layer simply runs zero keys — so probe for one we know.
 HASHCAT_RULE_DIR=""
-for cand in /usr/share/doc/hashcat/rules /usr/share/hashcat/rules /usr/share/doc/packages/hashcat/rules; do
-  if [ -d "$cand" ] && [ -n "$(ls -A "$cand" 2>/dev/null)" ]; then
+for cand in /usr/share/hashcat/rules /usr/share/doc/hashcat/rules /usr/share/doc/packages/hashcat/rules /usr/local/share/hashcat/rules; do
+  if [ -f "$cand/best66.rule" ] || [ -f "$cand/best64.rule" ]; then
     HASHCAT_RULE_DIR="$cand"; break
   fi
 done
 if [ -n "$HASHCAT_RULE_DIR" ]; then
   OK "hashcat rules: $HASHCAT_RULE_DIR"
-  # On some distros (Arch) the rules dir is NOT shipped with the binary package.
-  if [ ! -f "$HASHCAT_RULE_DIR/best66.rule" ]; then
-    WARN "best66.rule missing (hashcat rules not shipped on this distro)."
-    WARN "Install the hashcat rules package if available, or copy rules manually."
-    WARN "Rule layers will be skipped; wordlist/mask attacks still work."
+  if [ -f "$HASHCAT_RULE_DIR/best66.rule" ]; then
+    OK "generic rule: best66.rule (hashcat 7.x)"
+  else
+    OK "generic rule: best64.rule (hashcat 6.x)"
   fi
+  [ -f "$HASHCAT_RULE_DIR/leetspeak.rule" ] || WARN "leetspeak.rule missing — layer A3 will be skipped"
+  [ -f "$HASHCAT_RULE_DIR/combinator.rule" ] || WARN "combinator.rule missing — layer A5 will be skipped"
 else
   WARN "No hashcat rules dir found — rule layers will be skipped (wordlist/mask still run)."
-  WARN "On Kali/BlackArch, rules ship with hashcat. On Arch, use 'hashcat-utils' or copy from a Kali box."
+  WARN "On Arch the rules may not be shipped; copy best64/best66.rule into $WORDLISTS/ to fix it."
+fi
+
+# ---------------------------------------------------------------------------
+# 2b. hcxtools — hcxpcapngtool does pcap/pcapng -> hashcat -m 22000
+# ---------------------------------------------------------------------------
+if ! command -v hcxpcapngtool >/dev/null 2>&1; then
+  WARN "hcxpcapngtool not found (from hcxtools) — the pipeline cannot convert captures."
+  WARN "Installing hcxtools..."
+  install_pkg hcxtools || WARN "Could not install hcxtools — install it manually (Arch: pacman -S hcxtools)."
+fi
+if command -v hcxpcapngtool >/dev/null 2>&1; then
+  OK "hcxpcapngtool: $(hcxpcapngtool --version 2>/dev/null | head -1)"
+else
+  ERR "hcxpcapngtool still missing: .pcap conversion will fail. Pass an existing .22000 instead."
 fi
 
 # --- OpenCL/GPU backend sanity (per-distro, non-fatal) ---
@@ -125,26 +147,29 @@ fi
 
 # ---------------------------------------------------------------------------
 # 3. Wordlists (rockyou + VN). Clone from canonical sources if missing.
+#
+#    rockyou.txt is ONLY used by --full (the wpa-sec-covered generic layer),
+#    so a missing rockyou is not fatal for the default run.
 # ---------------------------------------------------------------------------
 [ -d "$WORDLISTS" ] || mkdir -p "$WORDLISTS"
 
-# rockyou: expect the full 14.3M-line one. A tiny subset is NOT usable.
 ROCKYOU="$WORDLISTS/rockyou.txt"
 rc_size() { [ -f "$1" ] && stat -c%s "$1" 2>/dev/null || echo 0; }
 if [ "$(rc_size "$ROCKYOU")" -lt 10000000 ]; then
-  WARN "rockyou.txt missing/too small — trying to obtain a full copy..."
+  WARN "rockyou.txt missing/too small — trying to obtain a full copy (only needed for --full)..."
   # 1) system seclists copy
   SYS_RY="/usr/share/wordlists/seclists/Passwords/Leaked-Databases/rockyou.txt"
   if [ -f "$SYS_RY" ] && [ "$(stat -c%s "$SYS_RY")" -gt 10000000 ]; then
     cp "$SYS_RY" "$ROCKYOU"; OK "Copied system rockyou.txt ($(du -h "$ROCKYOU" | cut -f1))"
   else
-    # 2) download a canonical google-10000 / rockyou mirror (worst case fallback)
+    # 2) download a canonical rockyou mirror (worst case fallback)
     WARN "No local full rockyou. Attempting download (~134MB)..."
     curl -fsSL --retry 3 -o "$ROCKYOU" \
       "https://raw.githubusercontent.com/brannondorsey/naive-hashcat/master/rockyou.txt" \
       && OK "Downloaded rockyou.txt ($(du -h "$ROCKYOU" | cut -f1))" \
       || { WARN "Download failed. Try:  sudo pacman -S seclists  (then run again)."
-           WARN "   or manually place a plaintext rockyou.txt (14.3M lines, >10MB) at $ROCKYOU."; }
+           WARN "   or manually place a plaintext rockyou.txt (14.3M lines, >10MB) at $ROCKYOU."
+           WARN "   The default run does not need it: only --full does."; }
   fi
 else
   OK "rockyou.txt ($(du -h "$ROCKYOU" | cut -f1))"
@@ -163,6 +188,10 @@ if [ ! -d "$VI_DIR" ] || [ ! -f "$VI_DIR/wordlists-vn1k.txt" ]; then
   git clone --depth 1 https://github.com/lucthienphong1120/wordlists-vi.git "$VI_DIR" \
     2>&1 | tail -2 || WARN "clone wordlists-vi failed (skip: network?)"
 fi
+
+# VN rules live in the repo; make sure they survived a fresh clone.
+[ -f "$WORDLISTS/vn-heavy.rule" ] || WARN "vn-heavy.rule missing from $WORDLISTS — layers A2/B7 will be skipped"
+[ -f "$WORDLISTS/vn-lite.rule" ]  || WARN "vn-lite.rule missing from $WORDLISTS — layers B6 will be skipped"
 
 # ---------------------------------------------------------------------------
 # 4. GPU / OpenCL sanity

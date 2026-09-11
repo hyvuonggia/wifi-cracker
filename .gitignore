@@ -18,8 +18,9 @@ __pycache__/
 venv/
 
 # --- large wordlists fetched at runtime (not in repo) ---
-# rockyou.txt (134MB) exceeds GitHub's 100MB hard limit → crack_all.sh
-# downloads it on first run. Never commit it.
+# rockyou.txt (134MB) exceeds GitHub's 100MB hard limit, and it is only used by
+# `crack.py --full` (the layers wpa-sec already covers). crack_all.sh downloads it
+# on demand. Never commit it.
 wordlists/rockyou.txt
 wordlists/rockyou.txt.gz
 

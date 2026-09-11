@@ -1,192 +1,295 @@
-# Wi-Fi Cracker — WPA/WPA2 .22000 pipeline
+# Wi-Fi Cracker — WPA/WPA2 handshake cracking, pcap-first
 
-Crack WPA/WPA2 handshakes & PMKID (`.22000` trích từ Porkchop / Cardputer) bằng
-**hashcat** trên máy **Dell Precision 7520** (CachyOS/Arch, GPU **Quadro M2200**
-qua OpenCL ~**94k H/s**).
+Drop a **`.pcap`** capture in, get the passphrase out.
 
-Pipeline thiết kế **rule-based trước, wordlist giữa, mask cuối** — vì pass thật
-người Việt hầu hết là **từ + biến thể nhỏ** (`trung123`, `Trung@2026`,
-`hoang1234`) chứ không phải số thuần. Rule attack trúng cao hơn bruteforce.
+This tool converts your capture to a hashcat hash file with `hcxpcapngtool`
+(hcxtools), attacks it with **hashcat** on a **Dell Precision 7520** (CachyOS/Arch,
+GPU **Quadro M2200** over OpenCL, ~**94k H/s** at `-m 22000`), and hands whatever
+it cannot crack to **wpa-sec.stanev.org** for the volunteer queue to chew on.
 
-> ⚠️ **Chỉ crack mạng/máy bạn sở hữu hoặc được phép.** Bắt handshake + crack pass
-> người khác = xâm nhập trái phép (Điều 291 Bộ luật Hình sự VN).
+The pipeline is deliberately **rule-based first, wordlists second, masks last**,
+because real passphrases are a word plus a small variation (`trung123`,
+`Trung@2026`, `hoang1234`) rather than random noise — a rule attack beats a mask
+attack over the same keyspace.
+
+> ⚠️ **Only crack networks and machines you own or are licensed to test.**
+> Capturing a stranger's handshake and cracking it is unauthorised access
+> (Article 291 of the Vietnamese Penal Code). Use your own lab: one phone as a
+> hotspot, one phone as the victim.
 
 ---
 
-## Cấu trúc repo
+## 1. What it does, end to end
+
+```
+ handshakes/pending/ANH HY_FC4009E1E14E.pcap
+              │
+              │  ① hcxpcapngtool   (pcap/pcapng -> hashcat -m 22000)
+              ▼
+        ANH HY_FC4009E1E14E_hs.22000  +  work/essids/<name>.essid
+              │
+              │  ② hashcat -m 22000   (layered: rules -> wordlists -> masks)
+              ▼
+   cracked ──► handshakes/success/      (+ password in work/potfiles/<stem>.potfile)
+   not cracked ──► ③ upload the .pcap to wpa-sec  ──►  handshakes/fail/
+```
+
+The original capture is **kept next to the hash file** and travels with it,
+because **wpa-sec accepts `.pcap`/`.pcapng` and NOT `.22000`** — its conversion
+step rejects an already-converted file.
+
+---
+
+## 2. Requirements
+
+| Need | Why | Install |
+|---|---|---|
+| `hashcat` 6.x or 7.x | the cracking engine | Arch/CachyOS `sudo pacman -S hashcat` · Debian/Ubuntu `sudo apt install hashcat` |
+| `hcxpcapngtool` (hcxtools) | converts the capture to `.22000` | Arch `sudo pacman -S hcxtools` · Debian/Ubuntu `sudo apt install hcxtools` |
+| `python3` (3.10+) | runs `crack.py` / `wpasec.py` | usually already there |
+| working OpenCL GPU | real cracking speeds | Arch: `nvidia-utils` provides OpenCL; otherwise `ocl-icd` |
+| a wpa-sec key | hands the rest of the keyspace to the queue | https://wpa-sec.stanev.org/?get_key → save to `~/wifi-cracker/.wpasec_key` (chmod 600) |
+
+`crack_all.sh` checks all of this for you and installs what is missing (it
+detects apt / dnf / yum / pacman / zypper / apk).
+
+With the default settings **you do not need `rockyou.txt`** (134 MB) — it is only
+used by `--full`, and `crack_all.sh` downloads it on demand.
+
+---
+
+## 3. Repository layout
 
 ```
 wifi-cracker/
-├── crack.py                  # Pipeline chính (Python) — 2 mode
-├── requirements.txt          # hashcat 7.x trên Arch
+├── crack.py                 # the pipeline (pcap -> 22000 -> crack -> classify -> wpa-sec)
+├── wpasec.py                # manual wpa-sec client: status | push <file|dir> | pull
+├── crack_all.sh             # entry point: environment check + install + hand off to crack.py
+├── requirements.txt
 ├── handshakes/
-│   ├── pending/              # hash mới, chưa thử — thả .pcap + _hs.22000 vào đây
-│   ├── success/              # đã crack (có password) — tự động chuyển vào sau khi chạy
-│   └── fail/                 # không crack được sau full pipeline — tự động chuyển vào
+│   ├── pending/             # DROP NEW CAPTURES HERE (.pcap / .pcapng / .cap)
+│   ├── success/             # cracked  -> password recovered (moved automatically)
+│   └── fail/                # not cracked locally (moved automatically)
 ├── wordlists/
-│   ├── rockyou.txt           # (KHÔNG commit — 134MB > giới hạn GitHub; crack_all.sh tự tải)
-│   ├── vie_wpa2_pw/          # wordlist + mask VN (cloned, bỏ .git)
-│   └── wordlists-vi/         # wordlist VN phổ thông (cloned, bỏ .git)
-└── work/                     # tạm — KHÔNG commit (gitignore)
-    ├── potfiles/             # 1 potfile riêng / hash — nguồn phân loại success/fail
-    └── logs/                 # log từng layer (A1..C5)
+│   ├── rockyou.txt          # NOT committed (134 MB > GitHub limit) -> crack_all.sh fetches it
+│   ├── vn-heavy.rule        # 446 Vietnamese rules  -> SMALL wordlists
+│   ├── vn-lite.rule         #  63 Vietnamese rules  -> LARGE wordlists
+│   ├── vie_wpa2_pw/         # VN leaked passwords + VN phone mask files (cloned from GitHub)
+│   └── wordlists-vi/        # VN general wordlists (cloned from GitHub)
+└── work/                    # scratch, NOT committed (gitignored)
+    ├── potfiles/            # one potfile PER HASH — the source of truth for success/fail
+    ├── logs/                # one log per layer (S1, A2, B1, C1, ...)
+    ├── essids/              # ESSID wordlist produced by the conversion step
+    └── nohandshake.txt      # captures that contained no EAPOL/PMKID
 ```
 
-- `handshakes/` + `wordlists/` + `crack.py` được **commit** (repo all-in-one).
-- `work/` (**tạm**) và mọi file lớn/cache **gitignore**.
-- `wordlists/` là từ 2 repo ngoài (vie_wpa2_pw, wordlists-vi) — đã **gỡ `.git`
-  lồng nhau** để nằm gọn trong 1 repo.
+`handshakes/`, `wordlists/` and the scripts are committed (one-stop repo).
+`work/` and anything large/cached is gitignored.
 
 ---
 
-## Cách dùng
-
-### Mode 1: Crack tất cả pending (mặc định, không truyền tham số)
+## 4. Quick start
 
 ```bash
+# 1. one-time
+git clone https://github.com/hyvuonggia/wifi-cracker.git ~/wifi-cracker
 cd ~/wifi-cracker
-python3 crack.py
+printf '%s' '<your-32-hex-key>' > .wpasec_key && chmod 600 .wpasec_key   # key from wpa-sec.stanev.org/?get_key
+
+# 2. drop a capture in the queue
+cp /run/media/sdcard/ANH\ HY_FC4009E1E14E.pcap ~/wifi-cracker/handshakes/pending/
+
+# 3. run it (converts, cracks, classifies, hands the rest to wpa-sec)
+./crack_all.sh --background     # detached, progress logged to work/crack.log
 ```
 
-Nó duyệt lần lượt mọi `*_hs.22000` trong `handshakes/pending/`, crack, rồi **tự
-phân loại**: có pass → `success/`, không có → `fail/`. Sau mỗi lần chạy, thả
-file mới vào `pending/` là lần chạy sau tự xử lý.
-
-### Mode 2: Crack 1 file cụ thể (truyền tham số)
+Look at the result with:
 
 ```bash
-python3 crack.py "handshakes/pending/ANH HY_FC4009E1E14E_hs.22000"
+ls ~/wifi-cracker/handshakes/success/          # cracked captures
+hashcat -m 22000 --potfile-path ~/wifi-cracker/work/potfiles/<stem>.potfile --show <file.22000>
 ```
 
-Chỉ crack **file đó**, sau đó cũng tự phân loại (move sang success/fail).
+---
 
-### Chạy nền (để máy treo)
+## 5. Division of labour with wpa-sec — this is the DEFAULT
 
-```bash
-python3 crack.py --background          # crack mọi pending, log ra work/crack.log, chạy detach
-python3 crack.py "file.22000" --background
-```
+Cracking the same keyspace twice is pure waste. `wpa-sec.stanev.org` already
+covers a big generic dictionary set, the complete 8-digit space and the WPS keys,
+so **the local machine by default only runs the layers wpa-sec cannot do**, and
+uploads every capture it could not crack.
 
-### Dry-run (xem lệnh, không crack, KHÔNG đụng file)
-
-```bash
-python3 crack.py --dry                 # liệt kê lệnh cho mọi pending
-python3 crack.py "file.22000" --dry    # liệt kê lệnh cho 1 file
-```
-
-> Dry-run **không di chuyển file** — chỉ in ra file sẽ được xếp vào success/fail.
-
-### Chia việc với WPA-SEC (không làm trùng)
-
-`wpa-sec.stanev.org` đã có sẵn kho từ điển generic khổng lồ (hashes.org, OffSec 33M,
-InsidePro, Wikipedia ×5, OpenWall), **toàn bộ số 8 chữ số** (Num8) và khoá WPS mặc
-định. Chạy lại mấy thứ đó ở máy là làm trùng — dùng 2 cờ này để chia việc:
-
-```bash
-python3 crack.py --vn-only                          # CHỈ chạy phần wpa-sec KHÔNG có
-python3 crack.py --vn-only --wpasec                 # + tự đẩy .pcap lên wpa-sec khi fail
-python3 crack.py --background --vn-only --wpasec    # combo khuyến nghị
-```
-
-| Tầng | Ai làm | Lý do |
+| Layer | wpa-sec already has it? | Who runs it by default |
 |---|---|---|
-| `A1`/`A4`/`A5` (rockyou + rule) | **wpa-sec** | kho generic khổng lồ |
-| `C4`/`C5` (8 chữ số) | **wpa-sec** | Num8 = toàn bộ 10⁸ |
-| `A2`/`A3` (VN + rule VN) | máy bạn | wpa-sec không có rule tiếng Việt |
-| `B1`–`B7` (wordlist VN) | máy bạn | wpa-sec không có từ điển Việt |
-| `C1`–`C3` (mask ĐT VN) | máy bạn | ĐT VN là **10 số**, wpa-sec chỉ có 8 số |
+| `S1` SSID-as-password | no — only your own capture knows the ESSID | **local** |
+| `A2` VN leaked dict + `vn-heavy.rule` | no VN rules server-side | **local** |
+| `A3` VN leaked dict + `leetspeak` | no VN data server-side | **local** |
+| `B1`–`B7` VN wordlists (dates, vn1k/10k/1m/wifi + rules) | no VN dictionaries server-side | **local** |
+| `C1`–`C3` Vietnamese phone masks (10 digits) | wpa-sec's `Num8` is 8 digits only | **local** |
+| `A1`/`A4`/`A5` rockyou + rules | yes (hashes.org, OffSec 33M, InsidePro, Wikipedia ×5, OpenWall) | wpa-sec |
+| `C4`/`C5` any 8 digits / 8 digits starting with 0 | yes (`Num8` = the whole 10⁸ space) | wpa-sec |
+| everything still unsolved | — | wpa-sec queue, 24/7 |
 
-→ `--vn-only` tiết kiệm ~**7,4 giờ/hash** trên Quadro M2200, và **không cần tải
-`rockyou.txt`** (134MB) nữa.
+* **`--full`** runs the wpa-sec-covered layers locally as well (the old behaviour).
+* **`--no-wpasec`** never uploads; local only.
+* Skipping rockyou + the 8-digit masks saves **~5 hours per hash** on a Quadro
+  M2200 (see the budget table below) and removes the need for `rockyou.txt`.
 
-Thao tác tay với wpa-sec:
+**Privacy:** wpa-sec results are public and searchable by BSSID+SSID. Upload lab
+captures, never your own home network.
+
+---
+
+## 6. Layer reference and cost
+
+Keyspaces/seconds assume **94k H/s** (`-m 22000`, Quadro M2200, OpenCL).
+
+| Step | What it is | Keys | Time |
+|---|---|---|---|
+| `S1` | the ESSID itself + `vn-heavy.rule` | ~450 | instant |
+| `A2` | 384,189 leaked VN passwords × 446 VN rules | 171 M | **30 min** |
+| `A3` | 384,189 VN × `leetspeak` (25 rules) | 9.6 M | 1.7 min |
+| `B1` | common date patterns (`vie-common_date`, 44,736 lines) | 45 k | instant |
+| `B2`–`B5` | vn1k / vn10k / vn1m / vn-wifi wordlists | 1.4 M | ~20 s |
+| `B6` | vn-wifi (418k) × `vn-lite` (63 rules) | 26 M | 4.7 min |
+| `B7` | vn10k × `vn-heavy` (446 rules) | 4.5 M | 0.8 min |
+| `C1` | 27 VN phone prefixes × 10⁷ (10-digit numbers) | 270 M | **48 min** |
+| `C2` | 12 more prefixes × 10⁷ | 120 M | **21 min** |
+| `C3` | hotline / misc numbers | 10 k | instant |
+| **local default total** | | | **~1.8 h per hash** |
+| `A1` rockyou (14.3 M) × `best66` (78) | *`--full` only* | 1.1 B | 198 min |
+| `A4` rockyou × `leetspeak` | *`--full` only* | 359 M | 64 min |
+| `C4`/`C5` 8-digit masks | *`--full` only* | 200 M | 36 min |
+| **`--full` total** | | | **~6.7 h per hash** |
+
+The run **stops at the first hit**, so a password that shows up in `S1` costs
+milliseconds, not hours. `vn-heavy.rule` is for SMALL wordlists and `vn-lite.rule`
+for LARGE ones — 446 rules × a million words would explode the keyspace.
+
+---
+
+## 7. Command line
 
 ```bash
-python3 wpasec.py status                  # kiểm tra key
-python3 wpasec.py push handshakes/fail/   # đẩy mọi .pcap chưa gửi
-python3 wpasec.py pull                    # tải mật khẩu wpa-sec đã tìm được
+./crack.py                       # convert + crack every pending capture
+./crack.py "capture.pcap"        # one capture (a bare .22000 works too)
+./crack.py --background          # detached; log to work/crack.log
+./crack.py --dry                 # print every command, touch nothing
+./crack.py --convert-only        # only pcap -> _hs.22000 (no cracking)
+./crack.py --full                # also run the layers wpa-sec covers
+./crack.py --no-wpasec           # never upload to wpa-sec
+./crack.py --vn-only             # accepted for compatibility (= default)
 ```
 
-Key lấy ở https://wpa-sec.stanev.org/?get_key, lưu vào `~/wifi-cracker/.wpasec_key`
-(chmod 600, đã gitignore) hoặc biến môi trường `WPASEC_KEY`. **Không commit file
-key** — repo này là PUBLIC.
+| Flag | Effect |
+|---|---|
+| *(none)* | local = layers wpa-sec does **not** cover, upload failures to wpa-sec |
+| `--full` | local = **every** layer, including the wpa-sec-covered ones |
+| `--no-wpasec` | disable the upload |
+| `--dry` | print the plan, never write or move a file |
+| `--convert-only` | just run `hcxpcapngtool`, exit |
+| `--background` | detach (use this for long runs) |
+| `--vn-only`, `--wpasec` | legacy flags, now the default behaviour |
 
-⚠️ Server wpa-sec **CHỈ nhận `.pcap`/`.pcapng`, KHÔNG nhận `.22000`** (nó chạy
-`hcxpcapngtool`, tool này từ chối định dạng 22000). Phải giữ file `.pcap` gốc cạnh
-file `_hs.22000`, nếu không thì không đẩy lên được.
+Same command line works through the wrapper: `./crack_all.sh --background`.
 
----
+### Naming convention
 
-## Cách capture handshake (từ Cardputer/Porkchop)
+```
+  capture:  <base>.pcap          hash:  <base>_hs.22000
+            ANH HY_FC4009E1E14E.pcap  ->  ANH HY_FC4009E1E14E_hs.22000
+```
 
-1. Porkchop **OINK** (quét) → chọn mạng mục tiêu → deauth → bắt đủ 4-way
-   handshake / PMKID → cắm SD → copy file `.pcap` + `_hs.22000` về laptop.
-2. Đặt vào `~/wifi-cracker/handshakes/pending/` (cả `.pcap` + `_hs.22000`).
-3. Chạy `python3 crack.py`.
-
-> Lưu ý: chỉ cần file `.22000` để crack; `.pcap` (bản gốc) được kéo theo để markup
-> SSID/BSSID dễ đọc, và **bắt buộc giữ lại** nếu muốn đẩy lên wpa-sec (`--wpasec`
-> hoặc `wpasec.py push`) — server chỉ nhận pcap, không nhận `.22000`.
-
----
-
-## Chi tiết pipeline (thứ tự tấn công)
-
-**Phase A — Ưu tiên tiếng Việt** (rẻ, tỉ lệ trúng cao nhất — chạy trước)
-- `A2` VN leaked + `vn-heavy.rule` (446 rule: năm 1960–2029, đuôi số phổ biến,
-  `@`/`.`/`_`/`-`, leet)
-- `A3` VN leaked + `leetspeak.rule` (`trung@123` → `trung123`)
-
-**Phase A′ — Generic** (wpa-sec ĐÃ CÓ → bỏ khi `--vn-only`)
-- `A1` rockyou + `best64.rule` · `A4` rockyou + `leetspeak` · `A5` rockyou + `combinator`
-
-**Phase B — Wordlist VN**
-- `B1` ngày tháng `vie-common_date` · `B2` vn1k · `B3` vn10k · `B4` vn1m ·
-  `B5` vn-wifi
-- `B6` vn-wifi + `vn-lite.rule` · `B7` vn10k + `vn-heavy.rule`
-
-**Phase C — Mask** (brute theo pattern — sau cùng, trúng thấp)
-- `C1` phone VN main (28 prefix) · `C2` phone VN sub (13) · `C3` misc (hotline)
-- `C4` 8-số bất kỳ · `C5` 8-số bắt đầu bằng 0 — *wpa-sec đã có (Num8) → bỏ khi `--vn-only`*
-
-Pipeline **dừng ngay khi crack được** (tiết kiệm thời gian trên máy Quadro).
-
-> `vn-heavy.rule` (446 rule) dùng cho wordlist **NHỎ**, `vn-lite.rule` (63 rule)
-> cho wordlist **LỚN** — nhiều rule × wordlist lớn = nổ không gian khoá. Cả 2 file
-> nằm trong `wordlists/`. Rule sinh từ **384.189 mật khẩu VN bị lộ**, đã tự kiểm
-> cú pháp bằng hashcat (0 lỗi).
+The pair is derived from the file name, which is why the two names must stay
+together: `*_hs.22000` is how the upload step finds the `.pcap` to send. If you
+drop in only a `.22000`, cracking still works but wpa-sec cannot be used for it.
 
 ---
 
-## Cải tiến so với phiên bản bash `crack_all.sh`
+## 8. Capturing a handshake (Porkchop on the Cardputer)
 
-| Vấn đề | Bash cũ | Python mới |
-|---|---|---|
-| `is_cracked()` dùng **potfile chung** → tưởng nhầm đã crack nếu potfile còn pass file trước, dừng sớm + phân loại sai | ⚠️ &nbsp;nbsp;có | ✅ **1 potfile riêng / hash** (`work/potfiles/<stem>.potfile`), `is_cracked()` chỉ khớp **chính hash đó** |
-| Dry-run **vẫn move file** (move nhầm sang fail) | ⚠️ có | ✅ dry-run **chỉ in, không đụng filesystem** |
-| Chỉ crack 1 file (phải truyền) | ⚠️ có | ✅ **2 mode** (all-pending + 1 file) và phân loại tự động |
-| Phân loại thủ công | ⚠️ có | ✅ tự động success/fail/pending |
-| `RULE_DIR` trỏ `/usr/share/doc/hashcat/rules` (sai trên Debian/Arch) + rule `best66.rule` **không tồn tại** trong hashcat → **toàn bộ Phase A là code chết, chưa từng chạy** | ⚠️ có | ✅ tự dò đúng thư mục rules, dùng `best64.rule`, guard file thiếu (không crash) |
-| Chạy trùng keyspace với wpa-sec | ⚠️ có | ✅ `--vn-only` (bỏ tầng đã được cover) + `--wpasec` (đẩy phần còn lại) |
+1. Porkchop → **OINK** → pick the target → deauth → capture a complete 4-way
+   handshake or a PMKID → eject the SD card.
+2. Copy the **`.pcap`** to `~/wifi-cracker/handshakes/pending/`.
+   (If Porkchop also wrote a `_hs.22000`, copy it too — the pipeline re-generates
+   it from the `.pcap` anyway.)
+3. Run `./crack_all.sh --background`.
+
+If the capture contains **no EAPOL/PMKID at all**, the pipeline says so, logs the
+file to `work/nohandshake.txt`, and moves it to `fail/` — re-capture with a longer
+deauth or wait for the client to reconnect.
 
 ---
 
-## Yêu cầu môi trường
+## 9. Where the recovered passwords are
 
-- **hashcat 7.x** trên Arch: `sudo pacman -S hashcat`
-- GPU hoạt động qua **OpenCL**. Nếu bị cảnh báo "CUDA SDK not installed", thêm
-  `--backend-ignore-cuda` (mặc định trong script) để sạch log.
-- `rockyou.txt` (134MB) KHÔNG commit (vượt giới hạn GitHub). `crack_all.sh` tự tải về
-  khi thiếu 2014 từ seclists hệ thống hoặc mirror online.
-  → **Chạy `--vn-only` thì KHÔNG cần `rockyou.txt`** (bỏ luôn tầng generic cho wpa-sec).
----
-
-## Password đã crack nằm ở đâu?
-
-- Mỗi hash có potfile riêng: `work/potfiles/<stem>.potfile`.
-- Xem pass của 1 hash cụ thể:
+* **One potfile per hash:** `work/potfiles/<stem>.potfile` — `hash:password` lines.
+  This is deliberate: a single shared potfile is what made the older bash script
+  report a false "cracked" whenever a stale password was still in it.
+* Show one hash's password:
   ```bash
   hashcat -m 22000 --potfile-path work/potfiles/<stem>.potfile --show <file.22000>
   ```
-- Hoặc đọc trực tiếp potfile (dòng `<hash>:<password>`).
-- Mật khẩu wpa-sec đã crack (sau `python3 wpasec.py pull`): `work/wpasec_results.txt`.
+* Passwords recovered by wpa-sec (after a pull): `work/wpasec_results.txt`.
+* Captures are filed automatically: `handshakes/success/` vs `handshakes/fail/`.
+
+---
+
+## 10. Manual wpa-sec client
+
+```bash
+./wpasec.py status                    # key check + counters
+./wpasec.py push handshakes/fail/      # upload every .pcap that was not sent yet
+./wpasec.py push capture.pcap          # upload a single capture
+./wpasec.py pull                      # download passwords already cracked for you
+```
+
+The key comes from `WPASEC_KEY` or `~/wifi-cracker/.wpasec_key` (gitignored,
+chmod 600). **Never commit the key** — this repository is public. Uploads are
+tracked in `work/wpasec_uploaded.txt` so nothing is sent twice (the server also
+answers `409` for a duplicate).
+
+---
+
+## 11. Improvements over the old bash-only `crack_all.sh`
+
+| Problem | Old bash | This Python pipeline |
+|---|---|---|
+| No conversion step: you had to convert the pcap yourself | ⚠️ | ✅ `hcxpcapngtool` runs inside the pipeline, and a capture with no handshake is reported instead of silently failing |
+| `is_cracked()` used **one shared potfile** → a stale password from another hash made it stop early and mis-classify | ⚠️ | ✅ **one potfile per hash**, matched with `hashcat --show` |
+| `--dry` still moved files | ⚠️ | ✅ dry mode never touches the filesystem |
+| Only one file per run, manual classification | ⚠️ | ✅ all-pending + single-file modes, automatic success/fail filing |
+| Rule directory hardcoded and rule named `best66.rule` on hashcat 6 (where it does not exist) → **the whole Phase A was dead code and never ran** | ⚠️ | ✅ rules are resolved at runtime (`best66.rule` *or* `best64.rule`, whichever exists), every resolved path is printed, and a missing rule warns loudly instead of silently skipping a layer |
+| Re-cracking keyspace wpa-sec already covers | ⚠️ | ✅ local runs only the VN/SSID/phone layers by default, the rest is uploaded |
+| `mask_count()` crashed the entire run on a missing mask file (`FileNotFoundError`) | ⚠️ | ✅ every helper is guarded against missing files |
+
+---
+
+## 12. Troubleshooting
+
+* **"SKIP <layer>: rule file not found"** — the pipeline prints the resolved rule
+  paths in the banner. hashcat 7.x ships `best66.rule`, hashcat 6.x ships
+  `best64.rule`; both are accepted. If you see `NONE FOUND`, install the rules or
+  copy them into `wordlists/`.
+* **A layer "ran" but did nothing** — a missing rule file is not an error to
+  hashcat, it just runs zero keys. Always run `--dry` after changing the pipeline
+  and count the layers that were actually emitted.
+* **Everything is slow on a CPU-only box** (e.g. the Hermes LXC) — that is
+  expected: use a CPU box to *prepare* wordlists and rules, and the M2200 to
+  crack. Real numbers above assume the GPU.
+* **`.22000` cannot be uploaded to wpa-sec** — correct, it only accepts native
+  `.pcap`/`.pcapng`. Keep the original capture.
+* **`hcxpcapngtool` appends to its output files.** Running it twice on the same
+  capture doubles the hash lines, so the pipeline deletes the outputs first.
+  Never call it twice by hand into the same file.
+* **A 0-try capture for the wrong reason** — Porkchop sometimes writes a `.pcap`
+  with only the beacon. Check `work/nohandshake.txt`.
+
+---
+
+## 13. Legal
+
+Only ever captive/crack your own networks or a lab you are authorised to test.
+Capturing a third party's handshake and cracking it is a criminal offence in
+Vietnam (Article 291) and in most other jurisdictions. The two-phone lab (one
+hotspot, one victim) is the right place to learn this.
