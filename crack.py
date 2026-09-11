@@ -180,6 +180,29 @@ MASK_SRC = {
 HC_BASE = ["-m", "22000", "-w", "3", "--backend-ignore-cuda",
            "--status", "--status-timer", "5", "--hwmon-temp-abort", "95"]
 
+# --- keep the machine awake while cracking --------------------------------
+# hashcat runs headless, so systemd-logind decides the box is idle and suspends
+# it mid-crack. On this laptop a suspend hangs the GPU (failing BGA joint) and
+# leaves a black screen until reboot. systemd-inhibit pins the idle lock for
+# exactly as long as hashcat runs, then releases it -- the same mechanism a video
+# player uses.
+_INHIBIT_BASE = ["systemd-inhibit", "--what=idle", "--who=wifi-cracker",
+                 "--mode=block", "--why=Cracking WPA2"]
+
+
+def _inhibit_available() -> bool:
+    """systemd-inhibit exists AND can actually take a lock here (needs logind)."""
+    if not shutil.which("systemd-inhibit"):
+        return False
+    try:
+        r = subprocess.run([*_INHIBIT_BASE, "true"], capture_output=True, timeout=15)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+INHIBIT = _INHIBIT_BASE if _inhibit_available() else []
+
 # ---------------------------------------------------------------------------
 # Telegram notifications (optional). Token lives in ~/wifi-cracker/.telegram_secret
 # (gitignored, chmod 600). Without it, notifications are silently skipped.
@@ -454,7 +477,7 @@ def run_dict(label, wordlist, hash_path, potfile, dry=False):
     _tel(label)
     with log.open("a") as f:
         subprocess.run(
-            [HASHCAT, "-a", "0", *HC_BASE, f"--potfile-path={potfile}",
+            [*INHIBIT, HASHCAT, "-a", "0", *HC_BASE, f"--potfile-path={potfile}",
              str(hash_path), str(wordlist)],
             stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
 
@@ -472,7 +495,7 @@ def run_dict_rule(label, wordlist, rule, hash_path, potfile, dry=False):
     _tel(label)
     with log.open("a") as f:
         subprocess.run(
-            [HASHCAT, "-a", "0", *HC_BASE, "-r", str(rule), f"--potfile-path={potfile}",
+            [*INHIBIT, HASHCAT, "-a", "0", *HC_BASE, "-r", str(rule), f"--potfile-path={potfile}",
              str(hash_path), str(wordlist)],
             stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
 
@@ -499,7 +522,7 @@ def run_maskfile(label, maskfile, hash_path, potfile, dry=False):
             continue
         with open(LOGDIR / f"{label}.log", "a") as f:
             subprocess.run(
-                [HASHCAT, "-a", "3", *HC_BASE, f"--potfile-path={potfile}",
+                [*INHIBIT, HASHCAT, "-a", "3", *HC_BASE, f"--potfile-path={potfile}",
                  str(hash_path), line],
                 stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
         if is_cracked(hash_path, potfile):
@@ -517,7 +540,7 @@ def run_mask(label, mask_string, hash_path, potfile, dry=False):
     _tel(label)
     with log.open("a") as f:
         subprocess.run(
-            [HASHCAT, "-a", "3", *HC_BASE, f"--potfile-path={potfile}",
+            [*INHIBIT, HASHCAT, "-a", "3", *HC_BASE, f"--potfile-path={potfile}",
              str(hash_path), mask_string],
             stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
 
@@ -799,6 +822,7 @@ def banner(opts) -> None:
                 + ("cracking" if tool == HASHCAT else "pcap -> 22000 conversion"))
     INFO(f"generic rule: {GENERIC_RULE if GENERIC_RULE else 'NONE FOUND (A1/A4/A5 disabled)'}")
     INFO(f"leet rule   : {LEET_RULE if LEET_RULE else 'NONE FOUND (A3 disabled)'}")
+    INFO(f"keep awake  : {'systemd-inhibit idle lock active' if INHIBIT else 'systemd-inhibit not available'}")
     INFO(f"wordlists   : {BASE}")
     print()
 

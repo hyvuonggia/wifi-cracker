@@ -282,6 +282,12 @@ answers `409` for a duplicate).
 * **`hcxpcapngtool` appends to its output files.** Running it twice on the same
   capture doubles the hash lines, so the pipeline deletes the outputs first.
   Never call it twice by hand into the same file.
+* **The laptop suspends / blackscreens mid-crack** — `crack.py` wraps every
+  hashcat call in `systemd-inhibit --what=idle --mode=block`, so the idle lock
+  is held for exactly as long as hashcat runs (the banner prints whether the
+  inhibition is active). Without that, `systemd-logind` sees a headless machine
+  and suspends it mid-crack; on this laptop a suspend hangs the GPU (failing BGA
+  joint) and needs a reboot.
 * **A 0-try capture for the wrong reason** — Porkchop sometimes writes a `.pcap`
   with only the beacon. Check `work/nohandshake.txt`.
 
