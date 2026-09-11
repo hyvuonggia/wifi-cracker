@@ -288,6 +288,10 @@ answers `409` for a duplicate).
   inhibition is active). Without that, `systemd-logind` sees a headless machine
   and suspends it mid-crack; on this laptop a suspend hangs the GPU (failing BGA
   joint) and needs a reboot.
+* **`work/crack.log` stays empty during a `--background` run** — the child is
+  now spawned with `-u`/`PYTHONUNBUFFERED=1`, so `tail -f work/crack.log` shows
+  progress live. (A Python process whose stdout is a file or pipe block-buffers
+  4–8 KB before anything appears, which is what made the old log look frozen.)
 * **A 0-try capture for the wrong reason** — Porkchop sometimes writes a `.pcap`
   with only the beacon. Check `work/nohandshake.txt`.
 

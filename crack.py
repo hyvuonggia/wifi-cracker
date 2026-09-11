@@ -864,11 +864,16 @@ def main(argv):
         logf.parent.mkdir(parents=True, exist_ok=True)
         print(f"Starting background run -> logging to {logf}")
         child_args = [a for a in argv[1:] if a != "--background"]
+        # -u / PYTHONUNBUFFERED: without it Python block-buffers stdout into the
+        # log file and `tail -f work/crack.log` stays empty for minutes.
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         with logf.open("a") as f:
-            n = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), *child_args],
+            n = subprocess.Popen([sys.executable, "-u", str(Path(__file__).resolve()), *child_args],
                                  stdout=f, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL, start_new_session=True)
+                                 stdin=subprocess.DEVNULL, env=env,
+                                 start_new_session=True)
         print(f"PID {n.pid}")
+        print(f"Live progress: tail -f {logf}")
         return 0
 
     banner(opts)
